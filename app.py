@@ -1,46 +1,15 @@
-# app.py
+# app.py (REMOTE PARQUET VERSION, no disk needed)
+
 import os
 import duckdb
 import pandas as pd
 import streamlit as st
 
-# ---- bootstrap: download assets to a persistent data dir ----
-import os, pathlib, hashlib, requests, streamlit as st
+# ---------- CONFIG: URLs are provided as environment variables on Render ----------
+EDGES_URL = os.environ["EDGES_PARQUET_URL"]   # e.g. https://github.com/.../edges.parquet
+IDMAP_URL = os.environ["IDMAP_PARQUET_URL"]   # e.g. https://github.com/.../idmap.parquet
 
-DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "data"))
-
-def sha256_file(p: pathlib.Path) -> str:
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for b in iter(lambda: f.read(1024*1024), b""):
-            h.update(b)
-    return h.hexdigest()
-
-@st.cache_resource(show_spinner=True)
-def ensure_asset(local_name: str, url: str, sha256: str | None = None) -> str:
-    p = DATA_DIR / local_name
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if not p.exists():
-        with requests.get(url, stream=True, timeout=600) as r:
-            r.raise_for_status()
-            with open(p, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-    if sha256 and sha256_file(p) != sha256:
-        raise RuntimeError(f"SHA256 mismatch for {p}")
-    return str(p)
-
-# URLs (and optional hashes) come from Render env vars
-PPI_URL   = os.environ["PPI_DUCKDB_URL"]
-IDMAP_URL = os.environ["IDMAP_PARQUET_URL"]
-PPI_SHA   = os.environ.get("PPI_DUCKDB_SHA256")
-IDMAP_SHA = os.environ.get("IDMAP_PARQUET_SHA256")
-
-DB    = ensure_asset("ppi.duckdb",    PPI_URL,  PPI_SHA)
-IDMAP = ensure_asset("idmap.parquet", IDMAP_URL, IDMAP_SHA)
-
-# Reusable CASE expression to normalize UniProt CC locations -> categories
+# ---------- Location category mapping (normalized buckets) ----------
 LOC_CAT_EXPR = """
 CASE
   WHEN m.location IS NULL OR TRIM(m.location) = '' THEN 'Unknown'
@@ -52,12 +21,11 @@ CASE
   WHEN lower(m.location) LIKE '%endosom%' THEN 'Endosome'
   WHEN lower(m.location) LIKE '%peroxisom%' THEN 'Peroxisome'
   WHEN lower(m.location) LIKE '%cytosol%' OR lower(m.location) LIKE '%cytoplasm%' THEN 'Cytoplasm'
-  WHEN lower(m.location) LIKE '%nucleus%' OR lower(m.location) LIKE '%nucleoplasm%' OR lower(m.location) LIKE '%nucleolus%' OR lower(m.location) LIKE '%nuclear%' THEN 'Nucleus'
+  WHEN lower(m.location) LIKE '%nucleus%' OR lower(m.location) LIKE '%nucleoplasm%' OR lower(m.location) LIKE '%nucleolus%' OR lower(m.location) LIKE '%chromosom%' OR lower(m.location) LIKE '%chromatin%' THEN 'Nucleus'
   WHEN lower(m.location) LIKE '%cytoskeleton%' OR lower(m.location) LIKE '%microtubule%' OR lower(m.location) LIKE '%actin%' OR lower(m.location) LIKE '%intermediate filament%' THEN 'Cytoskeleton'
   WHEN lower(m.location) LIKE '%extracellular%' OR lower(m.location) LIKE '%secreted%' THEN 'Extracellular'
   WHEN lower(m.location) LIKE '%ribosom%' THEN 'Ribosome'
   WHEN lower(m.location) LIKE '%centrosom%' THEN 'Centrosome'
-  WHEN lower(m.location) LIKE '%chromosom%' OR lower(m.location) LIKE '%chromatin%' THEN 'Nucleus'
   WHEN lower(m.location) LIKE '%membrane%' THEN 'Membrane'
   ELSE 'Other'
 END
@@ -65,14 +33,23 @@ END
 
 @st.cache_resource
 def get_con():
-    import duckdb, os
-    con = duckdb.connect(DB)
-    idmap_path = os.path.abspath(IDMAP).replace("'", "''")
-    con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap_path}')")
+    con = duckdb.connect()  # in-memory
+    # Enable HTTP access for Parquet
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    con.execute("SET enable_http_metadata_cache = true;")
+    con.execute("SET http_metadata_cache_size = '256MB';")
+
+    # Sanitize single quotes for SQL literals
+    idmap = IDMAP_URL.replace("'", "''")
+    edges = EDGES_URL.replace("'", "''")
+
+    # Create views reading directly from the remote Parquet files
+    con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap}');")
+    con.execute(f"CREATE OR REPLACE VIEW edges AS SELECT * FROM parquet_scan('{edges}');")
     return con
 
 def get_candidates(con, query_text, limit=50):
-    # Use normalized location category in labels
     if query_text and " " not in query_text and len(query_text) <= 12:
         return con.execute(f"""
             WITH id_hits AS (
@@ -122,7 +99,6 @@ def get_display_name(con, uniprot_id):
     return row[0] if row else uniprot_id
 
 def get_partner_location_categories(con, uniprot_id, min_score=0.0, strength=None):
-    # Distinct normalized categories among partners (given score/strength filters)
     df = con.execute(f"""
     WITH nbrs AS (
       SELECT CASE WHEN e.src = ? THEN e.dst ELSE e.src END AS partner,
@@ -140,7 +116,6 @@ def get_partner_location_categories(con, uniprot_id, min_score=0.0, strength=Non
     return df["loc_cat"].tolist()
 
 def fetch_interactions(con, uniprot_id, min_score=0.0, strength=None, loc_cats=None, limit=5000):
-    # Optional filter on normalized categories
     cat_filter = ""
     cat_params = []
     if loc_cats:
@@ -169,11 +144,9 @@ def fetch_interactions(con, uniprot_id, min_score=0.0, strength=None, loc_cats=N
         ORDER BY n.score DESC
         LIMIT ?
     """, [uniprot_id, uniprot_id, uniprot_id, min_score, strength, strength] + cat_params + [limit]).df()
-
-    # Optional: enforce a clean column order
     return df[["partner_id", "partner_protein_name", "partner_location_category", "score", "strength"]]
-      
 
+# ---------- UI ----------
 st.set_page_config(page_title="PPI Explorer", layout="wide")
 st.title("Protein–Protein Interaction Explorer")
 
@@ -199,38 +172,25 @@ with st.sidebar:
     min_score = st.slider("Min probability", 0.0, 1.0, 0.0, 0.01)
     topk = st.number_input("Max rows", min_value=100, max_value=100000, value=5000, step=100)
 
-    # Location category filter (clean buckets)
     loc_cat_choices = []
     if selected:
         opts = get_partner_location_categories(con, selected, min_score=min_score, strength=strength)
         if opts:
             loc_cat_choices = st.multiselect("Partner location (category)", options=opts, default=[])
-        else:
-            st.caption("No location info available for partners.")
 
 if selected:
     selected_name = get_display_name(con, selected)
     st.subheader(f"Interactions for **{selected} — {selected_name}**")
-
-    df = fetch_interactions(
-        con,
-        selected,
-        min_score=min_score,
-        strength=strength,
-        loc_cats=loc_cat_choices if loc_cat_choices else None,
-        limit=int(topk)
-    )
-
+    df = fetch_interactions(con, selected, min_score=min_score, strength=strength,
+                            loc_cats=loc_cat_choices if loc_cat_choices else None,
+                            limit=int(topk))
     if df.empty:
         st.info("No interactions found with current filters.")
     else:
-        # Shows: ID, protein name, clean category, raw CC location, score, strength
         st.dataframe(df, height=600, width="stretch")
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected}_interactions.csv",
-            mime="text/csv"
-        )
+        st.download_button("Download CSV",
+                           df.to_csv(index=False).encode("utf-8"),
+                           file_name=f"{selected}_interactions.csv",
+                           mime="text/csv")
 else:
     st.info("Search for a UniProt ID or protein name on the left to begin.")
