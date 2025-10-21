@@ -51,21 +51,39 @@ def _download_to_tmp(url: str, filename: str) -> str:
     return str(dst)
 
 @st.cache_resource
+@st.cache_resource
 def get_con():
-    con = duckdb.connect(config={'custom_user_agent':'Mozilla/5.0','enable_http_metadata_cache':'true'})              # in-memory DB
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
+    import duckdb, os, tempfile, pathlib, requests
 
-    # 1) Read EDGES directly over HTTP
-    edges_url_sql = EDGES_URL.replace("'", "''")
-    con.execute(f"CREATE OR REPLACE VIEW edges AS SELECT * FROM parquet_scan('{edges_url_sql}');")
+    def _download_to_tmp(url: str, filename: str) -> str:
+        """Download a file with browser-like headers to /tmp/ppi_explorer; reuse if exists."""
+        tmp_dir = pathlib.Path(tempfile.gettempdir()) / "ppi_explorer"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        dst = tmp_dir / filename
+        if dst.exists() and dst.stat().st_size > 0:
+            return str(dst)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (DuckDB httpfs workaround)",
+            "Accept": "application/octet-stream",
+        }
+        with requests.get(url, headers=headers, stream=True, timeout=1800) as r:
+            r.raise_for_status()
+            with open(dst, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return str(dst)
 
-    # 2) Download the small IDMAP to /tmp, then read locally (avoids GitHub 403 with httpfs)
-    idmap_local = _download_to_tmp(IDMAP_URL, "idmap.parquet")
-    idmap_local_sql = idmap_local.replace("'", "''")
-    con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap_local_sql}');")
+    # Download BOTH files to local /tmp (avoids GitHub 403 for httpfs/range)
+    edges_local = _download_to_tmp(os.environ["EDGES_PARQUET_URL"], "edges.parquet")
+    idmap_local = _download_to_tmp(os.environ["IDMAP_PARQUET_URL"], "idmap.parquet")
+
+    con = duckdb.connect()  # in-memory DB
+    edges_sql = edges_local.replace("'", "''")
+    idmap_sql = idmap_local.replace("'", "''")
+    con.execute(f"CREATE OR REPLACE VIEW edges AS SELECT * FROM parquet_scan('{edges_sql}');")
+    con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap_sql}');")
     return con
-
 # -------------- rest of your existing code below (search, fetch_interactions, UI) --------------
 
 def get_candidates(con, query_text, limit=50):
