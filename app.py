@@ -4,8 +4,41 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
-DB = "ppi.duckdb"
-IDMAP = "idmap.parquet"
+# ---- bootstrap: download assets to a persistent data dir ----
+import os, pathlib, hashlib, requests, streamlit as st
+
+DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "data"))
+
+def sha256_file(p: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1024*1024), b""):
+            h.update(b)
+    return h.hexdigest()
+
+@st.cache_resource(show_spinner=True)
+def ensure_asset(local_name: str, url: str, sha256: str | None = None) -> str:
+    p = DATA_DIR / local_name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        with requests.get(url, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(p, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+    if sha256 and sha256_file(p) != sha256:
+        raise RuntimeError(f"SHA256 mismatch for {p}")
+    return str(p)
+
+# URLs (and optional hashes) come from Render env vars
+PPI_URL   = os.environ["PPI_DUCKDB_URL"]
+IDMAP_URL = os.environ["IDMAP_PARQUET_URL"]
+PPI_SHA   = os.environ.get("PPI_DUCKDB_SHA256")
+IDMAP_SHA = os.environ.get("IDMAP_PARQUET_SHA256")
+
+DB    = ensure_asset("ppi.duckdb",    PPI_URL,  PPI_SHA)
+IDMAP = ensure_asset("idmap.parquet", IDMAP_URL, IDMAP_SHA)
 
 # Reusable CASE expression to normalize UniProt CC locations -> categories
 LOC_CAT_EXPR = """
@@ -32,6 +65,7 @@ END
 
 @st.cache_resource
 def get_con():
+    import duckdb, os
     con = duckdb.connect(DB)
     idmap_path = os.path.abspath(IDMAP).replace("'", "''")
     con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap_path}')")
