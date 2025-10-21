@@ -38,7 +38,6 @@ def get_con():
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
     con.execute("SET enable_http_metadata_cache = true;")
-    con.execute("SET http_metadata_cache_size = '256MB';")
 
     # Sanitize single quotes for SQL literals
     idmap = IDMAP_URL.replace("'", "''")
