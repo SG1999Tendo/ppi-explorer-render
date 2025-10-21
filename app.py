@@ -52,11 +52,9 @@ def _download_to_tmp(url: str, filename: str) -> str:
 
 @st.cache_resource
 def get_con():
-    con = duckdb.connect()              # in-memory DB
+    con = duckdb.connect(config={'custom_user_agent':'Mozilla/5.0','enable_http_metadata_cache':'true'})              # in-memory DB
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
-    con.execute("SET enable_http_metadata_cache = true;")
-    con.execute("SET custom_user_agent = 'Mozilla/5.0';")  # important for GitHub
 
     # 1) Read EDGES directly over HTTP
     edges_url_sql = EDGES_URL.replace("'", "''")
