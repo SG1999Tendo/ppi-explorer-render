@@ -1,15 +1,14 @@
-# app.py (REMOTE PARQUET VERSION, no disk needed)
-
-import os
+# ---- REMOTE EDGES + LOCAL (TMP) IDMAP ----
+import os, tempfile, pathlib, requests
 import duckdb
 import pandas as pd
 import streamlit as st
 
-# ---------- CONFIG: URLs are provided as environment variables on Render ----------
-EDGES_URL = os.environ["EDGES_PARQUET_URL"]   # e.g. https://github.com/.../edges.parquet
-IDMAP_URL = os.environ["IDMAP_PARQUET_URL"]   # e.g. https://github.com/.../idmap.parquet
+# URLs from environment (Render -> Environment)
+EDGES_URL = os.environ["EDGES_PARQUET_URL"]
+IDMAP_URL = os.environ["IDMAP_PARQUET_URL"]
 
-# ---------- Location category mapping (normalized buckets) ----------
+# Normalized location buckets
 LOC_CAT_EXPR = """
 CASE
   WHEN m.location IS NULL OR TRIM(m.location) = '' THEN 'Unknown'
@@ -31,22 +30,45 @@ CASE
 END
 """
 
+@st.cache_resource(show_spinner=True)
+def _download_to_tmp(url: str, filename: str) -> str:
+    """Download a small file (idmap.parquet) with proper headers to a tmp path; reuse if already present."""
+    tmp_dir = pathlib.Path(tempfile.gettempdir()) / "ppi_explorer"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dst = tmp_dir / filename
+    if dst.exists() and dst.stat().st_size > 0:
+        return str(dst)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (DuckDB httpfs workaround)",
+        "Accept": "application/octet-stream",
+    }
+    with requests.get(url, headers=headers, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    return str(dst)
+
 @st.cache_resource
 def get_con():
-    con = duckdb.connect()  # in-memory
-    # Enable HTTP access for Parquet
+    con = duckdb.connect()              # in-memory DB
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
     con.execute("SET enable_http_metadata_cache = true;")
+    con.execute("SET http_user_agent = 'Mozilla/5.0';")  # important for GitHub
 
-    # Sanitize single quotes for SQL literals
-    idmap = IDMAP_URL.replace("'", "''")
-    edges = EDGES_URL.replace("'", "''")
+    # 1) Read EDGES directly over HTTP
+    edges_url_sql = EDGES_URL.replace("'", "''")
+    con.execute(f"CREATE OR REPLACE VIEW edges AS SELECT * FROM parquet_scan('{edges_url_sql}');")
 
-    # Create views reading directly from the remote Parquet files
-    con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap}');")
-    con.execute(f"CREATE OR REPLACE VIEW edges AS SELECT * FROM parquet_scan('{edges}');")
+    # 2) Download the small IDMAP to /tmp, then read locally (avoids GitHub 403 with httpfs)
+    idmap_local = _download_to_tmp(IDMAP_URL, "idmap.parquet")
+    idmap_local_sql = idmap_local.replace("'", "''")
+    con.execute(f"CREATE OR REPLACE VIEW idmap AS SELECT * FROM parquet_scan('{idmap_local_sql}');")
     return con
+
+# -------------- rest of your existing code below (search, fetch_interactions, UI) --------------
 
 def get_candidates(con, query_text, limit=50):
     if query_text and " " not in query_text and len(query_text) <= 12:
