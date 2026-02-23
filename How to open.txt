@@ -1,3 +1,5 @@
 Custom app to predict protein protein interaction between 2 proteins using the new RF2-PPI algorithm
 
 To open just go to : https://ppi-explorer-render.onrender.com/
+
+Raw files are in the Compressed archive
